@@ -226,8 +226,8 @@ func TestTimerNondeterminism(t *testing.T) {
 		const iterations = 1000
 		var seen1, seen2 bool
 		for range iterations {
-			tm1 := time.NewTimer(0)
-			tm2 := time.NewTimer(0)
+			tm1 := time.NewTimer(1)
+			tm2 := time.NewTimer(1)
 			select {
 			case <-tm1.C:
 				seen1 = true
@@ -275,6 +275,57 @@ func TestSleepNondeterminism(t *testing.T) {
 			synctest.Wait()
 		}
 		t.Errorf("after %v iterations, seen goroutine 1:%v, 2:%v; want both", iterations, seen1, seen2)
+	})
+}
+
+// TestTimerRunsImmediately verifies that a 0-duration timer sends on its channel
+// without waiting for the bubble to block.
+func TestTimerRunsImmediately(t *testing.T) {
+	synctest.Run(func() {
+		start := time.Now()
+		tm := time.NewTimer(0)
+		select {
+		case got := <-tm.C:
+			if !got.Equal(start) {
+				t.Errorf("<-tm.C = %v, want %v", got, start)
+			}
+		default:
+			t.Errorf("0-duration timer channel is not readable; want it to be")
+		}
+	})
+}
+
+// TestTimerRunsLater verifies that reading from a timer's channel receives the
+// timer fired, even when that time is in reading from a timer's channel receives the
+// time the timer fired, even when that time is in the past.
+func TestTimerRanInPast(t *testing.T) {
+	synctest.Run(func() {
+		delay := 1 * time.Second
+		want := time.Now().Add(delay)
+		tm := time.NewTimer(delay)
+		time.Sleep(2 * delay)
+		select {
+		case got := <-tm.C:
+			if !got.Equal(want) {
+				t.Errorf("<-tm.C = %v, want %v", got, want)
+			}
+		default:
+			t.Errorf("0-duration timer channel is not readable; want it to be")
+		}
+	})
+}
+
+// TestAfterFuncRunsImmediately verifies that a 0-duration AfterFunc is scheduled
+// without waiting for the bubble to block.
+func TestAfterFuncRunsImmediately(t *testing.T) {
+	synctest.Run(func() {
+		var b atomic.Bool
+		time.AfterFunc(0, func() {
+			b.Store(true)
+		})
+		for !b.Load() {
+			runtime.Gosched()
+		}
 	})
 }
 
@@ -437,7 +488,7 @@ func TestDeadlockRoot(t *testing.T) {
 }
 
 func TestDeadlockChild(t *testing.T) {
-	defer wantPanic(t, "deadlock: all goroutines in bubble are blocked")
+	defer wantPanic(t, "deadlock: main bubble goroutine has exited but blocked goroutines remain")
 	synctest.Run(func() {
 		go func() {
 			select {}
@@ -446,7 +497,7 @@ func TestDeadlockChild(t *testing.T) {
 }
 
 func TestDeadlockTicker(t *testing.T) {
-	defer wantPanic(t, "deadlock: all goroutines in bubble are blocked")
+	defer wantPanic(t, "deadlock: main bubble goroutine has exited but blocked goroutines remain")
 	synctest.Run(func() {
 		go func() {
 			for range time.Tick(1 * time.Second) {
@@ -677,6 +728,34 @@ func TestWaitGroupMovedBetweenBubblesAfterWait(t *testing.T) {
 		// Reusing the WaitGroup is safe, because its count is zero.
 		wg.Go(func() {})
 		wg.Wait()
+	})
+}
+
+var testWaitGroupLinkerAllocatedWG sync.WaitGroup
+
+func TestWaitGroupLinkerAllocated(t *testing.T) {
+	synctest.Run(func() {
+		// This WaitGroup is probably linker-allocated and has no span,
+		// so we won't be able to add a special to it associating it with
+		// this bubble.
+		//
+		// Operations on it may not be durably blocking,
+		// but they shouldn't fail.
+		testWaitGroupLinkerAllocatedWG.Go(func() {})
+		testWaitGroupLinkerAllocatedWG.Wait()
+	})
+}
+
+var testWaitGroupHeapAllocatedWG = new(sync.WaitGroup)
+
+func TestWaitGroupHeapAllocated(t *testing.T) {
+	synctest.Run(func() {
+		// This package-scoped WaitGroup var should have been heap-allocated,
+		// so we can associate it with a bubble.
+		testWaitGroupHeapAllocatedWG.Add(1)
+		go testWaitGroupHeapAllocatedWG.Wait()
+		synctest.Wait()
+		testWaitGroupHeapAllocatedWG.Done()
 	})
 }
 
